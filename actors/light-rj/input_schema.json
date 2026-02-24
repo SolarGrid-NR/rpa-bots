@@ -1,0 +1,46 @@
+{
+    "title": "Light RJ Actor Input",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "username": {
+            "title": "CPF/CNPJ/Email",
+            "type": "string",
+            "description": "Username for Light RJ portal",
+            "editor": "textfield"
+        },
+        "password": {
+            "title": "Password",
+            "type": "string",
+            "description": "Password for Light RJ portal",
+            "editor": "textfield",
+            "isSecret": true
+        },
+        "installationCode": {
+            "title": "Installation Code",
+            "type": "string",
+            "description": "The installation code to select (e.g., 0411464326)",
+            "editor": "textfield"
+        },
+        "referenceMonth": {
+            "title": "Reference Month",
+            "type": "string",
+            "description": "The billing month to download (e.g., Mar/2025)",
+            "editor": "textfield"
+        },
+        "captchaService": {
+            "title": "Captcha Service",
+            "type": "string",
+            "description": "Select which service to use for solving captchas. Only ANTICAPTCHA is supported now.",
+            "default": "ANTICAPTCHA",
+            "editor": "select",
+            "enum": [
+                "ANTICAPTCHA"
+            ]
+        }
+    },
+    "required": [
+        "username",
+        "password"
+    ]
+}

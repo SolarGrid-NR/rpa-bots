@@ -1,0 +1,20 @@
+{
+  "name": "actor-equatorial",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Equatorial RPA Actor",
+  "dependencies": {
+    "apify": "^3.1.10",
+    "crawlee": "^3.5.4",
+    "playwright": "^1.39.0",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  },
+  "scripts": {
+    "start": "npx tsx src/main.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^25.2.3",
+    "tsx": "^4.21.0"
+  }
+}

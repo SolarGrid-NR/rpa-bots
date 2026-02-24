@@ -1,0 +1,30 @@
+{
+    "title": "Robô Equatorial (Local)",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "uc": {
+            "title": "Unidade Consumidora",
+            "type": "string",
+            "editor": "textfield",
+            "description": "Apenas números"
+        },
+        "cpf": {
+            "title": "CPF ou CNPJ",
+            "type": "string",
+            "editor": "textfield",
+            "description": "Apenas números"
+        },
+        "targetDate": {
+            "title": "Mês/Ano da Fatura",
+            "type": "string",
+            "default": "12/2025",
+            "editor": "textfield",
+            "description": "Ex: 12/2025"
+        }
+    },
+    "required": [
+        "uc",
+        "cpf"
+    ]
+}
