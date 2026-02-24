@@ -305,19 +305,37 @@ try {
         }
 
         log('Submitting login...');
-        const submitBtnSelector = '.btn-entrar';
 
-        try {
-            await page.evaluate((selector) => {
-                const btn = document.querySelector(selector) as HTMLElement;
-                if (btn) btn.click();
-            }, submitBtnSelector);
-        } catch (e: any) {
-            log(`JS click failed: ${e.message}`);
+        let clicked = false;
+        const btnSelectors = ['button:has-text("ENTRAR")', '.btn-entrar', 'input[value="ENTRAR"]', 'input[type="submit"]'];
+
+        for (const sel of btnSelectors) {
+            if (await page.locator(sel).count() > 0) {
+                log(`Clicking submit button with selector: ${sel}`);
+                await page.locator(sel).first().click({ force: true });
+                clicked = true;
+                break;
+            }
+        }
+
+        if (!clicked) {
+            log('⚠️ Could not find exact login button. Falling back to JS click on .btn-entrar...');
+            try {
+                await page.evaluate(() => {
+                    const btn = document.querySelector('.btn-entrar') as HTMLElement;
+                    if (btn) btn.click();
+                });
+            } catch (e: any) {
+                log(`JS click failed: ${e.message}`);
+            }
         }
 
         log('Waiting for navigation/validation...');
-        await page.waitForLoadState('load', { timeout: 30000 });
+        // OutSystems login usually does an AJAX postback, so networkidle is more reliable than load
+        await Promise.race([
+            page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => null),
+            page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 }).catch(() => null)
+        ]);
         await page.waitForTimeout(3000); // Allow post-login JS to settle
 
         try {
@@ -518,14 +536,22 @@ try {
             if (count === 0 && !page.url().includes('Comprovante_Conta_Paga')) {
                 log(`⚠️ Bill for ${referenceMonth} not found on Open Bills. Trying Paid Bills page...`);
                 await page.goto('https://agenciavirtual.light.com.br/AGV_Comprovante_Conta_Paga_VW/Comprovante_Conta_Paga.aspx', { waitUntil: 'load', timeout: 30000 });
+                log(`✅ Successfully navigated to Paid Bills page.`);
                 await new Promise(r => setTimeout(r, 3000)); // settle
 
                 try { await page.waitForSelector('.accordion-group, .accordion-item', { timeout: 10000 }); } catch { }
 
-                // Re-find installation on paid bills page (try both possible class names)
-                installLocator = page.locator('.accordion-item, .accordion-group')
-                    .filter({ has: page.locator(`text="${installationCode}"`) })
+                // Specific struct: accordion-item containing verde-span with installationCode
+                installLocator = page.locator('.accordion-item')
+                    .filter({ has: page.locator(`.verde-span:has-text("${installationCode}")`) })
                     .first();
+
+                if (await installLocator.count() === 0) {
+                    // Fallback to broader search
+                    installLocator = page.locator('.accordion-item, .accordion-group')
+                        .filter({ has: page.locator(`text="${installationCode}"`) })
+                        .first();
+                }
 
                 if (await installLocator.count() > 0) {
                     log(`Found installation ${installationCode} on Paid Bills. Expanding...`);
@@ -535,23 +561,45 @@ try {
                     const paidHeader = installLocator.locator('.accordion-item-header, .accordion-heading, .accordion-toggle, [class*="header"], [class*="Header"]').first();
                     const paidIcon = installLocator.locator('.accordion-item-icon, .accordion-toggle i, i[class*="chevron"], [class*="chevron"], .fa-angle-down, i[class*="angle-down"]').last();
 
-                    if (await paidContentDiv.count() > 0 && (!await paidContentDiv.isVisible() || await paidContentDiv.innerText() === '')) {
-                        log('Clicking header to expand...');
-                        await paidHeader.click({ force: true }).catch(() => { });
-                        try {
-                            await paidContentDiv.waitFor({ state: 'visible', timeout: 5000 });
-                        } catch {
-                            log('⚠️ Header click didn\'t expand. Trying icon click (which might be the orange multiple bills chevron)...');
-                            if (await paidIcon.count() > 0) {
-                                await paidIcon.click({ force: true }).catch(() => { });
-                                await paidContentDiv.waitFor({ state: 'visible', timeout: 5000 }).catch(() => log('❌ Failed to wait for accordion content visibility!'));
+                    if (await paidContentDiv.count() > 0) {
+                        // Check if it's explicitly closed or hidden
+                        const isClosedProp = await installLocator.evaluate((el) => {
+                            return el.classList.contains('is--closed') || el.getAttribute('aria-expanded') === 'false';
+                        });
+
+                        const isHidden = !await paidContentDiv.isVisible() || await paidContentDiv.innerText() === '';
+
+                        if (isClosedProp || isHidden) {
+                            log('Clicking header to expand...');
+                            await paidHeader.click({ force: true }).catch(() => { });
+                            try {
+                                await paidContentDiv.waitFor({ state: 'visible', timeout: 5000 });
+                            } catch {
+                                log('⚠️ Header click didn\'t expand. Trying icon click (which might be the orange multiple bills chevron)...');
+                                if (await paidIcon.count() > 0) {
+                                    await paidIcon.click({ force: true }).catch(() => { });
+                                    await paidContentDiv.waitFor({ state: 'visible', timeout: 5000 }).catch(() => log('❌ Failed to wait for accordion content visibility!'));
+                                }
                             }
+                        } else {
+                            log('Paid Bills accordion appears to be already expanded.');
                         }
                     }
 
                     // Wait for AJAX content to load — use load + settle, not networkidle
                     await page.waitForLoadState('load').catch(() => { });
-                    await new Promise(r => setTimeout(r, 5000)); // extra settle for AJAX content
+                    await new Promise(r => setTimeout(r, 2000)); // initial settle
+
+                    // Explicitly wait out the "Carregando..." state if present
+                    try {
+                        // Sometimes it's a structural alert message inside the content div
+                        const carregandoAlert = paidContentDiv.locator('.alert:has-text("Carregando")');
+                        if (await carregandoAlert.isVisible({ timeout: 2000 })) {
+                            log('⏳ "Carregando" message detected. Waiting for it to finish...');
+                            await carregandoAlert.waitFor({ state: 'hidden', timeout: 30000 });
+                            log('✅ "Carregando" finished.');
+                        }
+                    } catch { }
 
                     try {
                         await page.waitForSelector('.Feedback_AjaxWait', { state: 'attached', timeout: 2000 });
@@ -564,9 +612,9 @@ try {
                     // Screenshot for diagnostics
                     await Actor.setValue('DEBUG_PAID_BILLS.png', await page.screenshot({ fullPage: true }), { contentType: 'image/png' });
 
-                    // Count rows in the whole installation block (some pages use table, some use div lists)
+                    // Count rows in the whole installation block (some pages use table, some use div lists, or cards)
                     // Be careful not to match main structural .row elements if they aren't records
-                    const paidRows = installLocator.locator('tr, .list-record, .TableVerticalAlign, .row.align-items-center');
+                    const paidRows = installLocator.locator('.card-accordion, tr, .list-record, .TableVerticalAlign, .row.align-items-center');
                     const paidRowCount = await paidRows.count();
                     log(`Paid Bills: Found ${paidRowCount} record elements in installation block.`);
 
@@ -593,17 +641,21 @@ try {
                     // Download button selectors based on recent site updates
                     const btnSelectors = '.fa-download, .fa-file-pdf-o, a[href*="Download" i], [id*="Download" i], [onclick*="download" i], button:has-text("Baixar"), span:has-text("Download"), span:has-text("Baixar"), a:has-text("Baixar"), a:has-text("Download"), .material-symbols-outlined:has-text("download"), [class*="material-symbols"]:has-text("download")';
 
-                    // Strategy 1: Look for download button in ancestor <tr> or .TableVerticalAlign or .row (table/grid layout)
+                    // Strategy 1: Look for download button in ancestor .card-accordion, <tr>, or .row
                     let downloadBtn = null;
-                    for (const xpath of ['./ancestor::tr', './ancestor::div[contains(@class, "TableVerticalAlign")]', './ancestor::div[contains(@class, "row")]']) {
+                    for (const xpath of ['./ancestor::div[contains(@class, "card-accordion")]', './ancestor::tr', './ancestor::div[contains(@class, "TableVerticalAlign")]', './ancestor::div[contains(@class, "row")]']) {
                         const ancestorRow = match.locator(`xpath=${xpath}`);
                         if (await ancestorRow.count() > 0) {
-                            const btnInRow = ancestorRow.locator(btnSelectors).first();
-                            if (await btnInRow.count() > 0) {
-                                downloadBtn = btnInRow;
-                                log(`  📎 Found download button in ancestor grid/row (${xpath})`);
-                                break;
+                            const btnLocators = ancestorRow.locator(btnSelectors);
+                            const countMatches = await btnLocators.count();
+                            for (let j = 0; j < countMatches; j++) {
+                                if (await btnLocators.nth(j).isVisible()) {
+                                    downloadBtn = btnLocators.nth(j);
+                                    log(`  📎 Found VISIBLE download button in ancestor grid/row (${xpath}) at index ${j}`);
+                                    break;
+                                }
                             }
+                            if (downloadBtn) break;
                         }
                     }
 
@@ -612,12 +664,16 @@ try {
                         for (const xpath of ['./ancestor::div[1]', './ancestor::div[2]', './ancestor::div[3]', './ancestor::li[1]', './ancestor::*[contains(@class,"row")][1]']) {
                             const container = match.locator(`xpath=${xpath}`);
                             if (await container.count() > 0) {
-                                const btnInContainer = container.locator(btnSelectors).first();
-                                if (await btnInContainer.count() > 0) {
-                                    downloadBtn = btnInContainer;
-                                    log(`  📎 Found download button via xpath: ${xpath}`);
-                                    break;
+                                const btnLocators = container.locator(btnSelectors);
+                                const countMatches = await btnLocators.count();
+                                for (let j = 0; j < countMatches; j++) {
+                                    if (await btnLocators.nth(j).isVisible()) {
+                                        downloadBtn = btnLocators.nth(j);
+                                        log(`  📎 Found VISIBLE download button via xpath: ${xpath} at index ${j}`);
+                                        break;
+                                    }
                                 }
+                                if (downloadBtn) break;
                             }
                         }
                     }
@@ -627,9 +683,17 @@ try {
                         const allButtons = installLocator.locator(btnSelectors);
                         const btnCount = await allButtons.count();
                         log(`  🔍 Fallback: Found ${btnCount} download-like buttons in installation block`);
-                        if (btnCount > i) {
-                            downloadBtn = allButtons.nth(i);
-                            log(`  📎 Using download button at index ${i}`);
+                        // Filter visible ones
+                        let visibleIdx = 0;
+                        for (let j = 0; j < btnCount; j++) {
+                            if (await allButtons.nth(j).isVisible()) {
+                                if (visibleIdx === i) {
+                                    downloadBtn = allButtons.nth(j);
+                                    log(`  📎 Using visible download button at logical index ${i} (DOM index ${j})`);
+                                    break;
+                                }
+                                visibleIdx++;
+                            }
                         }
                     }
 

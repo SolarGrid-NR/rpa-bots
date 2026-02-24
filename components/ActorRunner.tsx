@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import Form from '@rjsf/core';
 import validator from '@rjsf/validator-ajv8';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
@@ -22,6 +22,13 @@ export default function ActorRunner({ actors }: ActorRunnerProps) {
     const [runResult, setRunResult] = useState<any>(null);
     const [mounted, setMounted] = useState(false);
     const [logContent, setLogContent] = useState<string>('');
+    const logContainerRef = useRef<HTMLDivElement>(null);
+
+    useEffect(() => {
+        if (logContainerRef.current) {
+            logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+        }
+    }, [logContent]);
 
     // Prevent hydration mismatch for Radix UI components
     useEffect(() => {
@@ -265,7 +272,7 @@ export default function ActorRunner({ actors }: ActorRunnerProps) {
                                                     <Files className="h-3 w-3" />
                                                 </Button>
                                             </div>
-                                            <div className="flex-1 overflow-auto p-4 custom-scrollbar max-h-[300px]">
+                                            <div ref={logContainerRef} className="flex-1 overflow-auto p-4 custom-scrollbar max-h-[300px]">
                                                 <pre className="text-xs font-mono text-blue-300 whitespace-pre-wrap">
                                                     {logContent || 'No logs available.'}
                                                 </pre>

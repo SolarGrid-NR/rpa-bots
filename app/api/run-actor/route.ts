@@ -8,6 +8,7 @@ import { v4 as uuidv4 } from 'uuid';
 
 // Helper to wait for spawn
 const runActorProcess = (actorPath: string, storagePath: string, env: NodeJS.ProcessEnv) => {
+    const startTime = Date.now();
     return new Promise<{ code: number | null }>((resolve, reject) => {
         const logPath = path.join(storagePath, 'run.log');
 
@@ -62,7 +63,8 @@ const runActorProcess = (actorPath: string, storagePath: string, env: NodeJS.Pro
         });
 
         child.on('close', (code) => {
-            log(`Process exited with code ${code}`);
+            const durationSec = ((Date.now() - startTime) / 1000).toFixed(2);
+            log(`Process exited with code ${code}. Total execution time: ${durationSec}s`);
             try {
                 fsSync.writeFileSync(
                     path.join(storagePath, 'key_value_stores', 'default', 'status.json'),
