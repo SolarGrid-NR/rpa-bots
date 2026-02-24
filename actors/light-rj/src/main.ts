@@ -152,249 +152,301 @@ try {
         }
     });
 
-    // --- LOGIN LOGIC ---
+    // --- MAIN WORKER LOGIC ---
     try {
-        log('Navigating to portal...');
-        await page.goto('https://agenciavirtual.light.com.br/portal/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+        // --- LOGIN LOGIC ---
+        let loginSuccess = false;
+        let loginAttempts = 0;
+        const maxLoginAttempts = 3;
 
-        try {
-            await page.waitForSelector('body', { timeout: 10000 });
-        } catch { }
-
-        const usernameSelector = 'input[id*="wtUserNameInput"]';
-        const passwordSelector = 'input[id*="wtPasswordInput"]';
-
-        log('Starting Login Process...');
-
-        if (!username.includes('@')) {
-            username = username.replace(/\D/g, '');
-            log(`Cleaned Username (digits only): ${username}`);
-        }
-
-        log(`Waiting for inputs: ${usernameSelector}`);
-        try {
-            await page.waitForSelector(usernameSelector, { timeout: 20000 });
-        } catch (e) {
-            log('Timeout waiting for inputs. Dumping HTML...');
-            await Actor.setValue('PAGE_DUMP.html', await page.content(), { contentType: 'text/html' });
-            throw new Error('Inputs not found - check PAGE_DUMP.html');
-        }
-
-        log(`Final Input - Username: [${username}] | Password: [${password}]`);
-
-        const fillInput = async (selector: string, value: string) => {
+        while (!loginSuccess && loginAttempts < maxLoginAttempts) {
+            loginAttempts++;
+            log(`\n--- LOGIN ATTEMPT ${loginAttempts} OF ${maxLoginAttempts} ---`);
             try {
-                log(`Focusing input: ${selector}`);
-                await page.click(selector);
-                await page.focus(selector);
+                log('Navigating to portal...');
+                await page.goto('https://agenciavirtual.light.com.br/portal/', { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-                log(`Typing value into ${selector}...`);
-                await page.keyboard.type(value, { delay: 10 });
+                try {
+                    await page.waitForSelector('body', { timeout: 10000 });
+                } catch { }
 
-                await page.keyboard.press('Tab');
-                log(`Blurring input...`);
+                const usernameSelector = 'input[id*="wtUserNameInput"]';
+                const passwordSelector = 'input[id*="wtPasswordInput"]';
 
-                const finalVal = await page.inputValue(selector);
-                if (finalVal !== value) {
-                    log(`⚠️ Value mismatch after typing! Expected: ${value}, Got: ${finalVal}. Retrying with JS...`);
-                    await page.evaluate(({ sel, val }) => {
-                        const el = document.querySelector(sel) as HTMLInputElement;
-                        if (el) {
-                            el.value = val;
-                            el.dispatchEvent(new Event('input', { bubbles: true }));
-                            el.dispatchEvent(new Event('change', { bubbles: true }));
-                            el.dispatchEvent(new Event('blur', { bubbles: true }));
+                log('Starting Login Process...');
+
+                if (!username.includes('@')) {
+                    username = username.replace(/\D/g, '');
+                    log(`Cleaned Username (digits only): ${username}`);
+                }
+
+                log(`Waiting for inputs: ${usernameSelector}`);
+                try {
+                    await page.waitForSelector(usernameSelector, { timeout: 20000 });
+                } catch (e) {
+                    log('Timeout waiting for inputs. Dumping HTML...');
+                    await Actor.setValue('PAGE_DUMP.html', await page.content(), { contentType: 'text/html' });
+                    throw new Error('Inputs not found - check PAGE_DUMP.html');
+                }
+
+                log(`Final Input - Username: [${username}] | Password: [${password}]`);
+
+                const fillInput = async (selector: string, value: string) => {
+                    try {
+                        log(`Focusing input: ${selector}`);
+                        await page.click(selector);
+                        await page.focus(selector);
+
+                        log(`Typing value into ${selector}...`);
+                        await page.locator(selector).pressSequentially(value, { delay: 50 });
+
+                        await page.keyboard.press('Tab');
+                        log(`Blurring input...`);
+
+                        const finalVal = await page.inputValue(selector);
+                        if (finalVal !== value) {
+                            log(`⚠️ Value mismatch after typing! Expected: ${value}, Got: ${finalVal}. Retrying with JS...`);
+                            await page.evaluate(({ sel, val }) => {
+                                const el = document.querySelector(sel) as HTMLInputElement;
+                                if (el) {
+                                    el.value = val;
+                                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                                    el.dispatchEvent(new Event('blur', { bubbles: true }));
+                                }
+                            }, { sel: selector, val: value });
                         }
-                    }, { sel: selector, val: value });
+                    } catch (e: any) {
+                        log(`❌ Error filling ${selector}: ${e.message}`);
+                    }
+                };
+
+                await fillInput(usernameSelector, username);
+                await fillInput(passwordSelector, password);
+
+                log('Handling Captcha via ANTICAPTCHA...');
+
+                // Extract siteKey from captcha frame or page
+                const captchaFrame = page.frames().find(f => f.url().includes('google.com/recaptcha/api2/anchor'));
+
+                let siteKey = '';
+                if (captchaFrame) {
+                    log('Captcha frame found. Extracting siteKey...');
+                    const url = captchaFrame.url();
+                    const urlParams = new URL(url).searchParams;
+                    siteKey = urlParams.get('k') || '';
                 }
-            } catch (e: any) {
-                log(`❌ Error filling ${selector}: ${e.message}`);
-            }
-        };
 
-        await fillInput(usernameSelector, username);
-        await fillInput(passwordSelector, password);
-
-        log('Handling Captcha via ANTICAPTCHA...');
-
-        // Extract siteKey from captcha frame or page
-        const captchaFrame = page.frames().find(f => f.url().includes('google.com/recaptcha/api2/anchor'));
-
-        let siteKey = '';
-        if (captchaFrame) {
-            log('Captcha frame found. Extracting siteKey...');
-            const url = captchaFrame.url();
-            const urlParams = new URL(url).searchParams;
-            siteKey = urlParams.get('k') || '';
-        }
-
-        if (!siteKey) {
-            siteKey = await page.evaluate(() => {
-                const el = document.querySelector('[data-sitekey]');
-                return el ? (el.getAttribute('data-sitekey') || '') : '';
-            });
-        }
-
-        if (!siteKey) throw new Error('Could not find reCAPTCHA sitekey');
-        log(`SiteKey: ${siteKey}`);
-
-        const acKey = input.antiCaptchaKey || process.env.ANTI_CAPTCHA_KEY;
-        if (!acKey) throw new Error('Anti-Captcha selected but no key provided.');
-
-        const token = await solveAntiCaptcha(acKey, page.url(), siteKey);
-
-        // Inject the solved captcha token into the page
-        log('Injecting captcha token into page...');
-        await page.evaluate((tkn) => {
-            // Set the g-recaptcha-response textarea value (by ID)
-            const textarea = document.querySelector('#g-recaptcha-response') as HTMLTextAreaElement;
-            if (textarea) {
-                textarea.style.display = 'block';
-                textarea.value = tkn;
-            }
-
-            // Also try all textareas with name g-recaptcha-response
-            document.querySelectorAll('textarea[name="g-recaptcha-response"]').forEach((el) => {
-                (el as HTMLTextAreaElement).value = tkn;
-            });
-
-            // Also try any textarea inside a .g-recaptcha container
-            document.querySelectorAll('.g-recaptcha textarea').forEach((el) => {
-                (el as HTMLTextAreaElement).value = tkn;
-            });
-
-            // Try data-callback attribute on the recaptcha container
-            const container = document.querySelector('[data-sitekey]');
-            if (container) {
-                const callbackName = container.getAttribute('data-callback');
-                if (callbackName && typeof (window as any)[callbackName] === 'function') {
-                    (window as any)[callbackName](tkn);
-                    return;
+                if (!siteKey) {
+                    siteKey = await page.evaluate(() => {
+                        const el = document.querySelector('[data-sitekey]');
+                        return el ? (el.getAttribute('data-sitekey') || '') : '';
+                    });
                 }
-            }
 
-            // Try grecaptcha callback through the internal config
-            try {
-                if (typeof (window as any).___grecaptcha_cfg !== 'undefined') {
-                    const clients = (window as any).___grecaptcha_cfg.clients;
-                    for (const cKey in clients) {
-                        const client = clients[cKey];
-                        for (const key in client) {
-                            const val = client[key];
-                            if (typeof val === 'object' && val !== null) {
-                                for (const k2 in val) {
-                                    if (typeof val[k2] === 'object' && val[k2] !== null && typeof val[k2].callback === 'function') {
-                                        val[k2].callback(tkn);
-                                        return;
+                if (!siteKey) throw new Error('Could not find reCAPTCHA sitekey');
+                log(`SiteKey: ${siteKey}`);
+
+                const acKey = input.antiCaptchaKey || process.env.ANTI_CAPTCHA_KEY;
+                if (!acKey) throw new Error('Anti-Captcha selected but no key provided.');
+
+                const token = await solveAntiCaptcha(acKey, page.url(), siteKey);
+
+                // Inject the solved captcha token into the page
+                log('Injecting captcha token into page...');
+                await page.evaluate((tkn) => {
+                    const textareas = [
+                        document.querySelector('#g-recaptcha-response'),
+                        ...Array.from(document.querySelectorAll('textarea[name="g-recaptcha-response"]')),
+                        ...Array.from(document.querySelectorAll('.g-recaptcha textarea'))
+                    ];
+
+                    for (let i = 0; i < textareas.length; i++) {
+                        const ta = textareas[i] as HTMLTextAreaElement;
+                        if (!ta) continue;
+                        ta.value = tkn;
+                        // React specifically checks for this sometimes
+                        ta.dispatchEvent(new Event('input', { bubbles: true }));
+                        ta.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+
+                    // Try data-callback attribute on the recaptcha container
+                    const container = document.querySelector('[data-sitekey]');
+                    if (container) {
+                        const callbackName = container.getAttribute('data-callback');
+                        if (callbackName && typeof (window as any)[callbackName] === 'function') {
+                            (window as any)[callbackName](tkn);
+                            return;
+                        }
+                    }
+
+                    // Try grecaptcha callback through the internal config
+                    try {
+                        if (typeof (window as any).___grecaptcha_cfg !== 'undefined') {
+                            const clients = (window as any).___grecaptcha_cfg.clients;
+                            for (const cKey in clients) {
+                                const client = clients[cKey];
+                                for (const key in client) {
+                                    const val = client[key];
+                                    if (typeof val === 'object' && val !== null) {
+                                        for (const k2 in val) {
+                                            if (typeof val[k2] === 'object' && val[k2] !== null && typeof val[k2].callback === 'function') {
+                                                val[k2].callback(tkn);
+                                                return;
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
+                    } catch (e) { /* callback not found, that's ok */ }
+                }, token);
+                log('✅ Captcha token injected.');
+
+                await Actor.setValue('captcha_injected_debug.png', await page.screenshot(), { contentType: 'image/png' });
+
+                const currentPass = await page.inputValue(passwordSelector);
+                if (!currentPass) {
+                    log('⚠️ Password field lost value! Refilling...');
+                    await fillInput(passwordSelector, password);
+                }
+
+                log('Waiting 3 seconds for Captcha state bindings to settle...');
+                await page.waitForTimeout(3000);
+
+                log('Waiting for network idleness before clicking ENTRAR...');
+                await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => null);
+
+                log('Submitting login...');
+
+                let clicked = false;
+                const btnSelectors = ['button:has-text("ENTRAR")', '.btn-entrar', 'input[value="ENTRAR"]', 'input[type="submit"]'];
+
+                for (const sel of btnSelectors) {
+                    const btn = page.locator(sel).first();
+                    if (await btn.count() > 0 && await btn.isVisible()) {
+                        log(`Clicking submit button with selector: ${sel}`);
+                        // Use strict click without force: true to ensure the button is unobstructed
+                        await btn.click();
+                        clicked = true;
+                        break;
                     }
                 }
-            } catch (e) { /* callback not found, that's ok */ }
-        }, token);
-        log('✅ Captcha token injected.');
 
-        await Actor.setValue('captcha_injected_debug.png', await page.screenshot(), { contentType: 'image/png' });
+                if (!clicked) {
+                    log('⚠️ Could not find exact login button. Falling back to JS click on .btn-entrar...');
+                    try {
+                        await page.evaluate(() => {
+                            const btn = document.querySelector('.btn-entrar') as HTMLElement;
+                            if (btn) btn.click();
+                        });
+                    } catch (e: any) {
+                        log(`JS click failed: ${e.message}`);
+                    }
+                }
 
-        const currentPass = await page.inputValue(passwordSelector);
-        if (!currentPass) {
-            log('⚠️ Password field lost value! Refilling...');
-            await fillInput(passwordSelector, password);
-        }
+                log('Waiting for navigation/validation...');
+                // OutSystems login usually does an AJAX postback, so networkidle is more reliable than load
+                await Promise.race([
+                    page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => null),
+                    page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 }).catch(() => null)
+                ]);
+                await page.waitForTimeout(3000); // Allow post-login JS to settle
 
-        log('Submitting login...');
+                try {
+                    const errorMsgLoc = page.locator('.Feedback_Message_Error');
+                    if (await errorMsgLoc.isVisible({ timeout: 5000 })) {
+                        const errorMsg = await errorMsgLoc.innerText();
 
-        let clicked = false;
-        const btnSelectors = ['button:has-text("ENTRAR")', '.btn-entrar', 'input[value="ENTRAR"]', 'input[type="submit"]'];
+                        if (errorMsg.includes('robô')) {
+                            log(`⚠️ Captcha rejection banner detected! ("${errorMsg}")`);
+                            log(`OutSystems might have missed the token on the first click. Waiting 3s and retrying ENTRAR...`);
+                            await page.waitForTimeout(3000);
 
-        for (const sel of btnSelectors) {
-            if (await page.locator(sel).count() > 0) {
-                log(`Clicking submit button with selector: ${sel}`);
-                await page.locator(sel).first().click({ force: true });
-                clicked = true;
-                break;
-            }
-        }
+                            const retryBtn = page.locator('.btn-entrar').first();
+                            if (await retryBtn.isVisible()) {
+                                await retryBtn.click();
+                                await Promise.race([
+                                    page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => null),
+                                    page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 }).catch(() => null)
+                                ]);
+                                await page.waitForTimeout(3000);
 
-        if (!clicked) {
-            log('⚠️ Could not find exact login button. Falling back to JS click on .btn-entrar...');
-            try {
-                await page.evaluate(() => {
-                    const btn = document.querySelector('.btn-entrar') as HTMLElement;
-                    if (btn) btn.click();
-                });
+                                if (await errorMsgLoc.isVisible()) {
+                                    throw new Error(`Login failed on retry: ${await errorMsgLoc.innerText()}`);
+                                } else {
+                                    log(`✅ Retry click successfully triggered the form submission!`);
+                                }
+                            } else {
+                                throw new Error(`Login failed: ${errorMsg}`);
+                            }
+                        } else {
+                            throw new Error(`Login failed: ${errorMsg}`);
+                        }
+                    }
+                } catch (e: any) {
+                    if (e.message.includes('Login failed:')) throw e;
+                }
+
+                if (page.url().includes('login') || (await page.locator(usernameSelector).count() > 0)) {
+                    log('⚠️ Login form still present. Verifying...');
+                    if (await page.url().toLowerCase().includes('login')) {
+                        await Actor.setValue('LOGIN_STATE.png', await page.screenshot(), { contentType: 'image/png' });
+                        throw new Error('Login failed or redirected back to login.');
+                    }
+
+                    if (await page.locator('.Feedback_Message_Error').isVisible()) {
+                        const finalMsg = await page.locator('.Feedback_Message_Error').innerText();
+                        throw new Error(`Login failed: ${finalMsg}`);
+                    }
+                }
+
+                // Wait for a clear sign of being logged in (e.g. logout button, dashboard element, or URL change)
+                try {
+                    // The user confirmed that .../portal/Login.aspx IS the logged-in page.
+                    // The login form is on .../portal/ (default) or similar.
+
+                    await page.waitForLoadState('networkidle');
+
+                    // Check for explicit failure first
+                    if (await page.locator('.Feedback_Message_Error').isVisible()) {
+                        const finalMsg = await page.locator('.Feedback_Message_Error').innerText();
+                        throw new Error(`Login failed: ${finalMsg}`);
+                    }
+
+                    // Check for success markers
+                    // 1. URL is Login.aspx (User says this is success)
+                    // 2. "Bem vindo" text is visible
+                    // 3. Login inputs are gone
+
+                    const isLoginUrl = page.url().toLowerCase().includes('login.aspx');
+                    const hasWelcome = await page.getByText('Bem vindo', { exact: false }).isVisible();
+                    const hasLoginInput = await page.locator('input[id*="wtUserNameInput"]').isVisible();
+
+                    if (isLoginUrl || hasWelcome || !hasLoginInput) {
+                        log('✅ Login successful (detected via URL or content).');
+                    } else {
+                        await Actor.setValue('LOGIN_FAILURE_STATE.png', await page.screenshot(), { contentType: 'image/png' });
+                        throw new Error(`Login validation failed. URL: ${page.url()} | Has Welcome: ${hasWelcome} | Has Input: ${hasLoginInput}`);
+                    }
+
+                } catch (e: any) {
+                    throw new Error(`Login validation error: ${e.message}`);
+                }
+
+                log(`✅ Validated! Redirected to: ${page.url()}`);
+                loginSuccess = true;
+                await Actor.pushData({ status: 'success', url: page.url() });
+
             } catch (e: any) {
-                log(`JS click failed: ${e.message}`);
+                log(`❌ Login attempt ${loginAttempts} failed: ${e.message}`);
+                if (loginAttempts >= maxLoginAttempts) {
+                    throw new Error(`Failed to login after ${maxLoginAttempts} attempts.`);
+                }
+                log('Waiting 5 seconds before retrying...');
+                await page.waitForTimeout(5000);
             }
-        }
-
-        log('Waiting for navigation/validation...');
-        // OutSystems login usually does an AJAX postback, so networkidle is more reliable than load
-        await Promise.race([
-            page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => null),
-            page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 }).catch(() => null)
-        ]);
-        await page.waitForTimeout(3000); // Allow post-login JS to settle
-
-        try {
-            if (await page.locator('.Feedback_Message_Error').isVisible({ timeout: 5000 })) {
-                const errorMsg = await page.locator('.Feedback_Message_Error').innerText();
-                throw new Error(`Login failed: ${errorMsg}`);
-            }
-        } catch (e: any) {
-            if (e.message.includes('Login failed:')) throw e;
-        }
-
-        if (page.url().includes('login') || (await page.locator(usernameSelector).count() > 0)) {
-            log('⚠️ Login form still present. Verifying...');
-            if (await page.url().toLowerCase().includes('login')) {
-                await Actor.setValue('LOGIN_STATE.png', await page.screenshot(), { contentType: 'image/png' });
-                throw new Error('Login failed or redirected back to login.');
-            }
-
-            if (await page.locator('.Feedback_Message_Error').isVisible()) {
-                const finalMsg = await page.locator('.Feedback_Message_Error').innerText();
-                throw new Error(`Login failed: ${finalMsg}`);
-            }
-        }
-
-        // Wait for a clear sign of being logged in (e.g. logout button, dashboard element, or URL change)
-        try {
-            // The user confirmed that .../portal/Login.aspx IS the logged-in page.
-            // The login form is on .../portal/ (default) or similar.
-
-            await page.waitForLoadState('networkidle');
-
-            // Check for explicit failure first
-            if (await page.locator('.Feedback_Message_Error').isVisible()) {
-                const finalMsg = await page.locator('.Feedback_Message_Error').innerText();
-                throw new Error(`Login failed: ${finalMsg}`);
-            }
-
-            // Check for success markers
-            // 1. URL is Login.aspx (User says this is success)
-            // 2. "Bem vindo" text is visible
-            // 3. Login inputs are gone
-
-            const isLoginUrl = page.url().toLowerCase().includes('login.aspx');
-            const hasWelcome = await page.getByText('Bem vindo', { exact: false }).isVisible();
-            const hasLoginInput = await page.locator('input[id*="wtUserNameInput"]').isVisible();
-
-            if (isLoginUrl || hasWelcome || !hasLoginInput) {
-                log('✅ Login successful (detected via URL or content).');
-            } else {
-                await Actor.setValue('LOGIN_FAILURE_STATE.png', await page.screenshot(), { contentType: 'image/png' });
-                throw new Error(`Login validation failed. URL: ${page.url()} | Has Welcome: ${hasWelcome} | Has Input: ${hasLoginInput}`);
-            }
-
-        } catch (e: any) {
-            throw new Error(`Login validation error: ${e.message}`);
-        }
-
-        log(`✅ Validated! Redirected to: ${page.url()}`);
-        await Actor.pushData({ status: 'success', url: page.url() });
+        } // End of retry loop
 
         // --- INVOICE CAPTURE LOGIC ---
         const { installationCode, referenceMonth } = input;
@@ -707,10 +759,76 @@ try {
                             elementToClick = parentA;
                         }
 
-                        const [download] = await Promise.all([
-                            page.waitForEvent('download', { timeout: 60000 }).catch(() => null),
-                            elementToClick.click({ force: true })
-                        ]);
+                        // Trigger click but don't await download immediately since a modal might appear
+                        log(`Clicking download button...`);
+
+                        // Set up the listener BEFORE the click so we don't miss an immediate non-modal download
+                        const downloadPromise = page.waitForEvent('download', { timeout: 15000 }).catch(() => null);
+                        await elementToClick.click({ force: true });
+
+                        // Check if the "Selecione o motivo" modal popped up
+                        try {
+                            // OutSystems renders multiple .modal-wrapper instances in the DOM.
+                            // We need to look specifically for the one that becomes visible.
+                            const modal = page.locator('.modal-wrapper').filter({ hasText: 'Selecione o motivo' }).first();
+
+                            // Wait up to 4s for it to become visible
+                            await modal.waitFor({ state: 'visible', timeout: 4000 });
+                            log(`⚠️ "Selecione o motivo" modal detected. Handling it...`);
+
+                            // Wait for internal modal spinner if present
+                            try {
+                                const modalWait = modal.locator('.Feedback_AjaxWait');
+                                await modalWait.waitFor({ state: 'attached', timeout: 2000 });
+                                await modalWait.waitFor({ state: 'detached', timeout: 15000 });
+                            } catch { }
+
+                            const reasonSelect = modal.locator('select');
+                            if (await reasonSelect.count() > 0) {
+                                // Select "Comprovante de residência" (value "2")
+                                await reasonSelect.selectOption('2');
+                                log(`Selected reason "Comprovante de residência".`);
+
+                                // Small delay for the validation message or state change
+                                await new Promise(r => setTimeout(r, 1000));
+                            }
+
+                            const confirmBtn = modal.locator('input[type="submit"][value="CONFIRMAR DOWNLOAD"], .btn-laranja');
+                            if (await confirmBtn.count() > 0) {
+                                log(`Clicking "CONFIRMAR DOWNLOAD"...`);
+
+                                // Start listening for download before clicking confirm
+                                const [downloadAfterModal] = await Promise.all([
+                                    page.waitForEvent('download', { timeout: 60000 }).catch(() => null),
+                                    confirmBtn.first().click({ force: true })
+                                ]);
+
+                                if (downloadAfterModal) {
+                                    await downloadAfterModal.saveAs(savePath);
+                                    log(`✅ Downloaded: ${savePath}`);
+
+                                    const key = `invoice_${installationCode}_${referenceMonth.replace(/\//g, '-')}_${i + 1}.pdf`;
+                                    await Actor.setValue(key, fs.readFileSync(savePath), { contentType: 'application/pdf' });
+
+                                    await Actor.pushData({
+                                        status: 'downloaded',
+                                        file: key,
+                                        installation: installationCode,
+                                        month: referenceMonth
+                                    });
+                                    continue; // Move to next match
+                                } else {
+                                    log(`⚠️ Download event did not trigger after modal confirmation.`);
+                                    throw new Error('Download event timeout after modal');
+                                }
+                            }
+                        } catch (e: any) {
+                            log(`Modal check failed or timed out. Proceeding normally or download already started. (${e.message})`);
+                        }
+
+                        // Normal non-modal download flow (if modal didn't appear or if it was immediate)
+                        log(`Awaiting normal download stream...`);
+                        const download = await downloadPromise;
 
                         if (download) {
                             await download.saveAs(savePath);
