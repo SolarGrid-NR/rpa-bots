@@ -1,0 +1,12 @@
+{
+    "actorSpecification": 1,
+    "name": "light-rj",
+    "title": "Light RJ Bill Downloader",
+    "description": "RPA actor to download bills from Light RJ",
+    "version": "0.1",
+    "meta": {
+        "templateId": "ts-playwright"
+    },
+    "input": "./input_schema.json",
+    "dockerfile": "../Dockerfile"
+}
