@@ -7,6 +7,9 @@
     "meta": {
         "templateId": "ts-playwright"
     },
-    "input": "./input_schema.json",
-    "dockerfile": "../Dockerfile"
+    "input": "../input_schema.json",
+    "dockerfile": "../Dockerfile",
+    "proxyConfiguration": {
+        "useApifyProxy": true
+    }
 }

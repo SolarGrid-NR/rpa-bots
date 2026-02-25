@@ -123,8 +123,33 @@ try {
 
     log(`Starting Light RJ Worker for user: ${username}`);
 
+    // --- PROXY SETUP ---
+    log('Requesting Apify Brazilian Residential Proxy...');
+    const proxyConfiguration = await Actor.createProxyConfiguration({
+        groups: ['RESIDENTIAL'],
+        countryCode: 'BR',
+    });
+
+    if (!proxyConfiguration) {
+        throw new Error('Failed to create proxy configuration. Do you have access to Residential Proxies?');
+    }
+    const proxyUrl = await proxyConfiguration.newUrl();
+    if (!proxyUrl) {
+        throw new Error('Failed to generate a proxy URL. Please check your Apify proxy access.');
+    }
+    log('✅ Proxy configured.');
+
+    // Playwright supports unified proxy URLs, but breaking it down is more robust and prevents auth drops
+    const parsedProxy = new URL(proxyUrl);
+    const proxyConfig = {
+        server: `${parsedProxy.protocol}//${parsedProxy.hostname}:${parsedProxy.port}`,
+        username: decodeURIComponent(parsedProxy.username),
+        password: decodeURIComponent(parsedProxy.password)
+    };
+
     const browser = await chromium.launch({
         headless: true, // Always run headless
+        proxy: proxyConfig,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -163,8 +188,8 @@ try {
             loginAttempts++;
             log(`\n--- LOGIN ATTEMPT ${loginAttempts} OF ${maxLoginAttempts} ---`);
             try {
-                log('Navigating to portal...');
-                await page.goto('https://agenciavirtual.light.com.br/portal/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+                log('Navigating to portal... (Timeout 90s)');
+                await page.goto('https://agenciavirtual.light.com.br/portal/', { waitUntil: 'domcontentloaded', timeout: 90000 });
 
                 try {
                     await page.waitForSelector('body', { timeout: 10000 });
@@ -388,58 +413,48 @@ try {
                     if (e.message.includes('Login failed:')) throw e;
                 }
 
-                if (page.url().includes('login') || (await page.locator(usernameSelector).count() > 0)) {
-                    log('⚠️ Login form still present. Verifying...');
-                    if (await page.url().toLowerCase().includes('login')) {
-                        await Actor.setValue('LOGIN_STATE.png', await page.screenshot(), { contentType: 'image/png' });
-                        throw new Error('Login failed or redirected back to login.');
-                    }
+                log('Verifying login success...');
+                await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => null);
 
-                    if (await page.locator('.Feedback_Message_Error').isVisible()) {
-                        const finalMsg = await page.locator('.Feedback_Message_Error').innerText();
-                        throw new Error(`Login failed: ${finalMsg}`);
-                    }
+                const currentUrl = page.url();
+                const isFormPresent = await page.locator('input[id*="wtUserNameInput"]').isVisible();
+                const hasWelcome = await page.getByText('Bem vindo', { exact: false }).isVisible() || await page.getByText('BEM-VINDO', { exact: false }).isVisible();
+
+                // Wait up to 5s for the error banner to appear, as OutSystems can be slow to render it
+                const errorLocator = page.locator('.Feedback_Message_Error');
+                await errorLocator.waitFor({ state: 'visible', timeout: 5000 }).catch(() => null);
+                const hasError = await errorLocator.isVisible();
+
+                log(`Post-login state: URL=${currentUrl} | Form=${isFormPresent} | Welcome=${hasWelcome} | Error=${hasError}`);
+
+                if (hasError) {
+                    const errorText = await page.locator('.Feedback_Message_Error').innerText();
+                    await Actor.setValue(`LOGIN_ERROR_MESSAGE_${loginAttempts}.png`, await page.screenshot({ fullPage: true }), { contentType: 'image/png' });
+                    throw new Error(`Login failed with explicit error: ${errorText}`);
                 }
 
-                // Wait for a clear sign of being logged in (e.g. logout button, dashboard element, or URL change)
-                try {
-                    // The user confirmed that .../portal/Login.aspx IS the logged-in page.
-                    // The login form is on .../portal/ (default) or similar.
-
-                    await page.waitForLoadState('networkidle');
-
-                    // Check for explicit failure first
-                    if (await page.locator('.Feedback_Message_Error').isVisible()) {
-                        const finalMsg = await page.locator('.Feedback_Message_Error').innerText();
-                        throw new Error(`Login failed: ${finalMsg}`);
-                    }
-
-                    // Check for success markers
-                    // 1. URL is Login.aspx (User says this is success)
-                    // 2. "Bem vindo" text is visible
-                    // 3. Login inputs are gone
-
-                    const isLoginUrl = page.url().toLowerCase().includes('login.aspx');
-                    const hasWelcome = await page.getByText('Bem vindo', { exact: false }).isVisible();
-                    const hasLoginInput = await page.locator('input[id*="wtUserNameInput"]').isVisible();
-
-                    if (isLoginUrl || hasWelcome || !hasLoginInput) {
-                        log('✅ Login successful (detected via URL or content).');
-                    } else {
-                        await Actor.setValue('LOGIN_FAILURE_STATE.png', await page.screenshot(), { contentType: 'image/png' });
-                        throw new Error(`Login validation failed. URL: ${page.url()} | Has Welcome: ${hasWelcome} | Has Input: ${hasLoginInput}`);
-                    }
-
-                } catch (e: any) {
-                    throw new Error(`Login validation error: ${e.message}`);
+                if (isFormPresent && !hasWelcome) {
+                    await Actor.setValue(`SILENT_LOGIN_FAILURE_${loginAttempts}.png`, await page.screenshot({ fullPage: true }), { contentType: 'image/png' });
+                    await Actor.setValue(`SILENT_LOGIN_FAILURE_${loginAttempts}.html`, await page.content(), { contentType: 'text/html' });
+                    throw new Error(`Login failed silently (Form still present). Check SILENT_LOGIN_FAILURE screenshots in KVS.`);
                 }
 
-                log(`✅ Validated! Redirected to: ${page.url()}`);
+                if (!currentUrl.toLowerCase().includes('login.aspx') && !hasWelcome) {
+                    await Actor.setValue(`UNKNOWN_LOGIN_STATE_${loginAttempts}.png`, await page.screenshot({ fullPage: true }), { contentType: 'image/png' });
+                    throw new Error(`Login state ambiguous. URL is ${currentUrl}.`);
+                }
+
+                log('✅ Login successful (detected via URL or content).');
+                log(`✅ Validated! Redirected to: ${currentUrl}`);
                 loginSuccess = true;
                 await Actor.pushData({ status: 'success', url: page.url() });
 
             } catch (e: any) {
                 log(`❌ Login attempt ${loginAttempts} failed: ${e.message}`);
+                try {
+                    await Actor.setValue(`TIMEOUT_SCREENSHOT_ATTEMPT_${loginAttempts}.png`, await page.screenshot(), { contentType: 'image/png' });
+                } catch (screenshotErr) { }
+
                 if (loginAttempts >= maxLoginAttempts) {
                     throw new Error(`Failed to login after ${maxLoginAttempts} attempts.`);
                 }
@@ -762,8 +777,13 @@ try {
                         // Trigger click but don't await download immediately since a modal might appear
                         log(`Clicking download button...`);
 
-                        // Set up the listener BEFORE the click so we don't miss an immediate non-modal download
-                        const downloadPromise = page.waitForEvent('download', { timeout: 15000 }).catch(() => null);
+                        // Listen for both download and popup events
+                        const downloadEventPromise = page.waitForEvent('download', { timeout: 25000 }).catch(() => null);
+                        const popupEventPromise = page.waitForEvent('popup', { timeout: 25000 }).catch(() => null);
+
+                        // Wait for any AJAX requests that might be generating the file
+                        const requestPromise = page.waitForResponse(response => response.url().includes('Download') || response.headers()['content-type'] === 'application/pdf', { timeout: 20000 }).catch(() => null);
+
                         await elementToClick.click({ force: true });
 
                         // Check if the "Selecione o motivo" modal popped up
@@ -798,55 +818,98 @@ try {
                                 log(`Clicking "CONFIRMAR DOWNLOAD"...`);
 
                                 // Start listening for download before clicking confirm
-                                const [downloadAfterModal] = await Promise.all([
-                                    page.waitForEvent('download', { timeout: 60000 }).catch(() => null),
-                                    confirmBtn.first().click({ force: true })
-                                ]);
+                                const downloadAfterModal = page.waitForEvent('download', { timeout: 60000 }).catch(() => null);
+                                const popupAfterModal = page.waitForEvent('popup', { timeout: 60000 }).catch(() => null);
 
-                                if (downloadAfterModal) {
-                                    await downloadAfterModal.saveAs(savePath);
-                                    log(`✅ Downloaded: ${savePath}`);
+                                await confirmBtn.first().click({ force: true });
 
-                                    const key = `invoice_${installationCode}_${referenceMonth.replace(/\//g, '-')}_${i + 1}.pdf`;
-                                    await Actor.setValue(key, fs.readFileSync(savePath), { contentType: 'application/pdf' });
+                                const dlModalResult = await downloadAfterModal;
+                                const popupModalResult = await popupAfterModal;
 
-                                    await Actor.pushData({
-                                        status: 'downloaded',
-                                        file: key,
-                                        installation: installationCode,
-                                        month: referenceMonth
-                                    });
-                                    continue; // Move to next match
+                                if (dlModalResult) {
+                                    await dlModalResult.saveAs(savePath);
+                                    log(`✅ Downloaded via standard event: ${savePath}`);
+                                } else if (popupModalResult) {
+                                    log(`✅ Download triggered via popup. Waiting for PDF...`);
+                                    await popupModalResult.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => null);
+                                    const pdfBuffer = await popupModalResult.pdf();
+                                    fs.writeFileSync(savePath, pdfBuffer);
+                                    log(`✅ Downloaded via popup PDF print: ${savePath}`);
+                                    await popupModalResult.close();
                                 } else {
                                     log(`⚠️ Download event did not trigger after modal confirmation.`);
                                     throw new Error('Download event timeout after modal');
                                 }
+
+                                const key = `invoice_${installationCode}_${referenceMonth.replace(/\//g, '-')}_${i + 1}.pdf`;
+                                await Actor.setValue(key, fs.readFileSync(savePath), { contentType: 'application/pdf' });
+
+                                await Actor.pushData({
+                                    status: 'downloaded',
+                                    file: key,
+                                    installation: installationCode,
+                                    month: referenceMonth
+                                });
+                                continue; // Move to next match
                             }
                         } catch (e: any) {
                             log(`Modal check failed or timed out. Proceeding normally or download already started. (${e.message})`);
                         }
 
                         // Normal non-modal download flow (if modal didn't appear or if it was immediate)
-                        log(`Awaiting normal download stream...`);
-                        const download = await downloadPromise;
+                        log(`Awaiting normal download stream or popup...`);
 
-                        if (download) {
-                            await download.saveAs(savePath);
-                            log(`✅ Downloaded: ${savePath}`);
+                        const [downloadResult, popupResult, responseResult] = await Promise.all([
+                            downloadEventPromise,
+                            popupEventPromise,
+                            requestPromise
+                        ]);
 
-                            const key = `invoice_${installationCode}_${referenceMonth.replace(/\//g, '-')}_${i + 1}.pdf`;
-                            await Actor.setValue(key, fs.readFileSync(savePath), { contentType: 'application/pdf' });
+                        if (downloadResult) {
+                            await downloadResult.saveAs(savePath);
+                            log(`✅ Downloaded via standard event: ${savePath}`);
+                        } else if (popupResult) {
+                            log(`✅ Download triggered via popup. Waiting for PDF load...`);
+                            // If the popup is directly a PDF URL, playwright might not render it as HTML. 
+                            // If it's a browser native PDF viewer, we can sometimes fetch its content.
+                            const popupUrl = popupResult.url();
+                            log(`Popup URL is: ${popupUrl}`);
 
-                            await Actor.pushData({
-                                status: 'downloaded',
-                                file: key,
-                                installation: installationCode,
-                                month: referenceMonth
-                            });
+                            try {
+                                // Try to fetch the URL directly with the browser's cookies
+                                const cookies = await context.cookies();
+                                const cookieString = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+
+                                const pdfResponse = await axios.get(popupUrl, {
+                                    headers: { 'Cookie': cookieString, 'User-Agent': await page.evaluate(() => navigator.userAgent) },
+                                    responseType: 'arraybuffer'
+                                });
+                                fs.writeFileSync(savePath, pdfResponse.data);
+                                log(`✅ Downloaded via popup URL fetch: ${savePath}`);
+                            } catch (e: any) {
+                                log(`⚠️ Failed to fetch popup URL directly: ${e.message}. Attempting page print...`);
+                                await popupResult.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => null);
+                                fs.writeFileSync(savePath, await popupResult.pdf());
+                            }
+                            await popupResult.close();
+                        } else if (responseResult && responseResult.headers()['content-type'] === 'application/pdf') {
+                            log(`✅ Download found in direct network response.`);
+                            const buffer = await responseResult.body();
+                            fs.writeFileSync(savePath, buffer);
                         } else {
                             log(`⚠️ Download event did not trigger for match ${i + 1}`);
                             throw new Error('Download event timeout');
                         }
+
+                        const key = `invoice_${installationCode}_${referenceMonth.replace(/\//g, '-')}_${i + 1}.pdf`;
+                        await Actor.setValue(key, fs.readFileSync(savePath), { contentType: 'application/pdf' });
+
+                        await Actor.pushData({
+                            status: 'downloaded',
+                            file: key,
+                            installation: installationCode,
+                            month: referenceMonth
+                        });
                     } else {
                         log(`⚠️ Download button not found for match ${i + 1}. Taking diagnostic screenshot...`);
                         await Actor.setValue(`DEBUG_NO_DL_BTN_${i + 1}.png`, await page.screenshot({ fullPage: true }), { contentType: 'image/png' });
