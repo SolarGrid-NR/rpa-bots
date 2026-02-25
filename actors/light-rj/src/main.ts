@@ -167,7 +167,7 @@ try {
     });
 
     const page = await context.newPage();
-    page.setDefaultTimeout(60000); // Increased timeout for manual interactions
+    page.setDefaultTimeout(60000);
 
     // Pipe browser logs to node console
     page.on('console', msg => {
@@ -175,6 +175,34 @@ try {
         if (text.includes('✅') || text.includes('❌') || text.includes('⚠️')) {
             log(`[BROWSER] ${text}`);
         }
+    });
+
+    log('Intercepting network requests to block heavy tracking/media assets and save bandwidth...');
+    await page.route('**/*', (route) => {
+        const request = route.request();
+        const resourceType = request.resourceType();
+        const url = request.url();
+
+        // Block tracking & analytics domains (confirmed present in page HTML)
+        if (
+            url.includes('google-analytics.com') ||
+            url.includes('googletagmanager.com') ||
+            url.includes('connect.facebook.net') ||
+            url.includes('fbevents.js') ||
+            url.includes('hotjar') ||
+            url.includes('fonts.googleapis.com') || // Material Icons - decorative only
+            url.includes('fonts.gstatic.com')        // Font files
+        ) {
+            return route.abort();
+        }
+
+        // Block images and media (not needed for automation)
+        // KEEP stylesheets: OutSystems uses CSS classes like 'displayNone' for visibility
+        if (['image', 'media', 'font'].includes(resourceType)) {
+            return route.abort();
+        }
+
+        return route.continue();
     });
 
     // --- MAIN WORKER LOGIC ---
@@ -328,7 +356,12 @@ try {
                 }, token);
                 log('✅ Captcha token injected.');
 
-                await Actor.setValue('captcha_injected_debug.png', await page.screenshot(), { contentType: 'image/png' });
+                // Verify captcha token was actually set
+                const tokenSet = await page.evaluate(() => {
+                    const ta = document.querySelector('#g-recaptcha-response') as HTMLTextAreaElement;
+                    return ta ? ta.value.length > 0 : false;
+                });
+                log(`Captcha token verification: ${tokenSet ? 'SET' : 'NOT SET'}`);
 
                 const currentPass = await page.inputValue(passwordSelector);
                 if (!currentPass) {
@@ -336,11 +369,8 @@ try {
                     await fillInput(passwordSelector, password);
                 }
 
-                log('Waiting 3 seconds for Captcha state bindings to settle...');
-                await page.waitForTimeout(3000);
-
-                log('Waiting for network idleness before clicking ENTRAR...');
-                await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => null);
+                // Brief settle time for OS bindings (reduced from 3s)
+                await page.waitForTimeout(1500);
 
                 log('Submitting login...');
 
@@ -370,82 +400,137 @@ try {
                     }
                 }
 
-                log('Waiting for navigation/validation...');
-                // OutSystems login usually does an AJAX postback, so networkidle is more reliable than load
-                await Promise.race([
-                    page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => null),
-                    page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 }).catch(() => null)
-                ]);
-                await page.waitForTimeout(3000); // Allow post-login JS to settle
+                log('Waiting for login response (element-based, no networkidle)...');
 
-                try {
-                    const errorMsgLoc = page.locator('.Feedback_Message_Error');
-                    if (await errorMsgLoc.isVisible({ timeout: 5000 })) {
-                        const errorMsg = await errorMsgLoc.innerText();
+                // Instead of networkidle (unreliable with residential proxies), wait for EITHER:
+                // 1. The login form to disappear (success)
+                // 2. A "Bem vindo" / welcome element to appear (success)
+                // 3. An error banner to appear (failure)
+                // 4. Timeout after 45s
+                const loginFormGone = page.locator('input[id*="wtUserNameInput"]').waitFor({ state: 'hidden', timeout: 45000 }).then(() => 'FORM_GONE').catch(() => null);
+                const welcomeAppeared = page.getByText('Bem vindo', { exact: false }).waitFor({ state: 'visible', timeout: 45000 }).then(() => 'WELCOME').catch(() => null);
+                const errorAppeared = page.locator('.Feedback_Message_Error').waitFor({ state: 'visible', timeout: 45000 }).then(() => 'ERROR').catch(() => null);
 
-                        if (errorMsg.includes('robô')) {
-                            log(`⚠️ Captcha rejection banner detected! ("${errorMsg}")`);
-                            log(`OutSystems might have missed the token on the first click. Waiting 3s and retrying ENTRAR...`);
-                            await page.waitForTimeout(3000);
+                const loginSignal = await Promise.race([loginFormGone, welcomeAppeared, errorAppeared]);
+                log(`Login signal received: ${loginSignal || 'TIMEOUT'}`);
 
-                            const retryBtn = page.locator('.btn-entrar').first();
-                            if (await retryBtn.isVisible()) {
-                                await retryBtn.click();
-                                await Promise.race([
-                                    page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => null),
-                                    page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 }).catch(() => null)
-                                ]);
-                                await page.waitForTimeout(3000);
+                // Brief settle for OutSystems post-navigation JS
+                await page.waitForTimeout(2000);
 
-                                if (await errorMsgLoc.isVisible()) {
-                                    throw new Error(`Login failed on retry: ${await errorMsgLoc.innerText()}`);
-                                } else {
-                                    log(`✅ Retry click successfully triggered the form submission!`);
-                                }
-                            } else {
-                                throw new Error(`Login failed: ${errorMsg}`);
+                // Check for error banner — OutSystems wraps errors in height:0px containers,
+                // so .isVisible() returns false! We must read the DOM text directly.
+                const errorText = await page.evaluate(() => {
+                    const el = document.querySelector('.Feedback_Message_Error .Feedback_Message_Text');
+                    return el ? (el as HTMLElement).innerText.trim() : '';
+                });
+                const hasError = errorText.length > 0;
+
+                if (hasError) {
+                    log(`⚠️ Error banner detected (via DOM text): "${errorText}"`);
+
+                    if (errorText.includes('robô')) {
+                        // Captcha rejection - retry ENTRAR without burning another captcha solve
+                        log('⚠️ Captcha rejection! Re-clicking ENTRAR (same token)...');
+                        await page.waitForTimeout(1500);
+                        const retryBtn = page.locator('.btn-entrar').first();
+                        if (await retryBtn.isVisible()) {
+                            await retryBtn.click();
+                            // Wait again for transition
+                            const retrySignal = await Promise.race([
+                                page.locator('input[id*="wtUserNameInput"]').waitFor({ state: 'hidden', timeout: 30000 }).then(() => 'FORM_GONE').catch(() => null),
+                                page.getByText('Bem vindo', { exact: false }).waitFor({ state: 'visible', timeout: 30000 }).then(() => 'WELCOME').catch(() => null),
+                            ]);
+                            log(`Retry signal: ${retrySignal || 'TIMEOUT'}`);
+                            await page.waitForTimeout(2000);
+
+                            const retryErrorText = await page.evaluate(() => {
+                                const el = document.querySelector('.Feedback_Message_Error .Feedback_Message_Text');
+                                return el ? (el as HTMLElement).innerText.trim() : '';
+                            });
+                            if (retryErrorText.length > 0) {
+                                await Actor.setValue(`LOGIN_ERROR_MESSAGE_${loginAttempts}.png`, await page.screenshot({ fullPage: true }), { contentType: 'image/png' });
+                                throw new Error(`Login failed on retry: ${retryErrorText}`);
                             }
+                            log('✅ Retry click worked!');
                         } else {
-                            throw new Error(`Login failed: ${errorMsg}`);
+                            await Actor.setValue(`LOGIN_ERROR_MESSAGE_${loginAttempts}.png`, await page.screenshot({ fullPage: true }), { contentType: 'image/png' });
+                            throw new Error(`Login failed (captcha rejected): ${errorText}`);
                         }
+                    } else if (errorText.includes('indisponível') || errorText.includes('temporariamente')) {
+                        // Server-side error — service temporarily unavailable
+                        await Actor.setValue(`SERVICE_UNAVAILABLE_${loginAttempts}.png`, await page.screenshot({ fullPage: true }), { contentType: 'image/png' });
+                        throw new Error(`Login failed (service unavailable): ${errorText}`);
+                    } else {
+                        await Actor.setValue(`LOGIN_ERROR_MESSAGE_${loginAttempts}.png`, await page.screenshot({ fullPage: true }), { contentType: 'image/png' });
+                        throw new Error(`Login failed with explicit error: ${errorText}`);
                     }
-                } catch (e: any) {
-                    if (e.message.includes('Login failed:')) throw e;
                 }
 
+                // Verify login state
                 log('Verifying login success...');
-                await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => null);
-
                 const currentUrl = page.url();
                 const isFormPresent = await page.locator('input[id*="wtUserNameInput"]').isVisible();
                 const hasWelcome = await page.getByText('Bem vindo', { exact: false }).isVisible() || await page.getByText('BEM-VINDO', { exact: false }).isVisible();
 
-                // Wait up to 5s for the error banner to appear, as OutSystems can be slow to render it
-                const errorLocator = page.locator('.Feedback_Message_Error');
-                await errorLocator.waitFor({ state: 'visible', timeout: 5000 }).catch(() => null);
-                const hasError = await errorLocator.isVisible();
+                log(`Post-login state: URL=${currentUrl} | Form=${isFormPresent} | Welcome=${hasWelcome}`);
 
-                log(`Post-login state: URL=${currentUrl} | Form=${isFormPresent} | Welcome=${hasWelcome} | Error=${hasError}`);
+                // If still on login.aspx with no welcome, OutSystems might still be doing its
+                // client-side AJAX transition. Wait longer before declaring failure.
+                if (currentUrl.toLowerCase().includes('login.aspx') && !hasWelcome) {
+                    log('⚠️ Still on Login.aspx with no welcome yet. Waiting for OutSystems AJAX transition (up to 15s)...');
 
-                if (hasError) {
-                    const errorText = await page.locator('.Feedback_Message_Error').innerText();
-                    await Actor.setValue(`LOGIN_ERROR_MESSAGE_${loginAttempts}.png`, await page.screenshot({ fullPage: true }), { contentType: 'image/png' });
-                    throw new Error(`Login failed with explicit error: ${errorText}`);
-                }
+                    // OutSystems does client-side rendering after login — the URL stays at Login.aspx
+                    // while the page content transitions to the dashboard. Wait for concrete signals.
+                    const transitionSignal = await Promise.race([
+                        page.getByText('Bem vindo', { exact: false }).waitFor({ state: 'visible', timeout: 15000 }).then(() => 'WELCOME').catch(() => null),
+                        page.waitForURL(/(?!.*login\.aspx)/i, { timeout: 15000 }).then(() => 'URL_CHANGED').catch(() => null),
+                    ]);
+                    log(`Transition signal: ${transitionSignal || 'TIMEOUT'}`);
 
-                if (isFormPresent && !hasWelcome) {
-                    await Actor.setValue(`SILENT_LOGIN_FAILURE_${loginAttempts}.png`, await page.screenshot({ fullPage: true }), { contentType: 'image/png' });
-                    await Actor.setValue(`SILENT_LOGIN_FAILURE_${loginAttempts}.html`, await page.content(), { contentType: 'text/html' });
-                    throw new Error(`Login failed silently (Form still present). Check SILENT_LOGIN_FAILURE screenshots in KVS.`);
+                    if (transitionSignal) {
+                        log(`✅ OutSystems transition completed: ${transitionSignal}`);
+                    } else {
+                        // Still no transition after 15s — now check more carefully
+                        const finalWelcome = await page.getByText('Bem vindo', { exact: false }).isVisible();
+                        const finalUrl = page.url();
+                        const finalFormPresent = await page.locator('input[id*="wtUserNameInput"]').isVisible();
+
+                        log(`Final state after waiting: URL=${finalUrl} | Form=${finalFormPresent} | Welcome=${finalWelcome}`);
+
+                        if (finalWelcome || !finalUrl.toLowerCase().includes('login.aspx')) {
+                            log('✅ Login succeeded (detected after extended wait).');
+                        } else if (finalFormPresent) {
+                            // Form is back — try double-click recovery
+                            log('⚠️ Form reappeared. Attempting double-click recovery...');
+                            const retryBtn = page.locator('.btn-entrar').first();
+                            if (await retryBtn.isVisible()) {
+                                await retryBtn.click();
+                                await page.getByText('Bem vindo', { exact: false }).waitFor({ state: 'visible', timeout: 20000 }).catch(() => null);
+                                await page.waitForTimeout(2000);
+                            }
+                            const lastWelcome = await page.getByText('Bem vindo', { exact: false }).isVisible();
+                            if (!lastWelcome) {
+                                await Actor.setValue(`SILENT_LOGIN_FAILURE_${loginAttempts}.png`, await page.screenshot({ fullPage: true }), { contentType: 'image/png' });
+                                await Actor.setValue(`SILENT_LOGIN_FAILURE_${loginAttempts}.html`, await page.content(), { contentType: 'text/html' });
+                                throw new Error(`Login failed silently (still on Login.aspx after double-click). Check KVS.`);
+                            }
+                        } else {
+                            // No form, no welcome, still login.aspx — server-side issue
+                            await Actor.setValue(`LOGIN_NO_REDIRECT_${loginAttempts}.png`, await page.screenshot({ fullPage: true }), { contentType: 'image/png' });
+                            await Actor.setValue(`LOGIN_NO_REDIRECT_${loginAttempts}.html`, await page.content(), { contentType: 'text/html' });
+                            throw new Error(`Login failed: still on Login.aspx after 15s wait (no welcome, no form). Check KVS.`);
+                        }
+                    }
                 }
 
                 if (!currentUrl.toLowerCase().includes('login.aspx') && !hasWelcome) {
+                    // Redirected somewhere unexpected
                     await Actor.setValue(`UNKNOWN_LOGIN_STATE_${loginAttempts}.png`, await page.screenshot({ fullPage: true }), { contentType: 'image/png' });
                     throw new Error(`Login state ambiguous. URL is ${currentUrl}.`);
                 }
 
-                log('✅ Login successful (detected via URL or content).');
-                log(`✅ Validated! Redirected to: ${currentUrl}`);
+                log('✅ Login successful (detected via URL change or Welcome text).');
+                log(`✅ Validated! Redirected to: ${page.url()}`);
                 loginSuccess = true;
                 await Actor.pushData({ status: 'success', url: page.url() });
 
@@ -473,7 +558,14 @@ try {
             const billsUrl = 'https://agenciavirtual.light.com.br/AGV_Segunda_Via_VW/';
             if (!page.url().includes('AGV_Segunda_Via_VW')) {
                 log(`Navigating to Bills Page: ${billsUrl}`);
-                await page.goto(billsUrl, { waitUntil: 'networkidle', timeout: 60000 });
+                await page.goto(billsUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
+                // Wait for the page content to actually render (accordion or up-to-date message)
+                log('Waiting for bills page content to render...');
+                await Promise.race([
+                    page.waitForSelector('.accordion-group', { timeout: 20000 }),
+                    page.waitForSelector('text=Você está em dia', { timeout: 20000 }),
+                    page.waitForTimeout(15000) // absolute fallback
+                ]).catch(() => log('⚠️ Bills page content wait timed out, proceeding...'));
             } else {
                 log('Already on Bills Page.');
             }
