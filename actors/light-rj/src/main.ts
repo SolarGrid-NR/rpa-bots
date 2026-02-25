@@ -169,6 +169,45 @@ try {
     const page = await context.newPage();
     page.setDefaultTimeout(60000);
 
+    // --- HAR CAPTURE (Phase 0 instrumentation — remove after capture) ---
+    const harEntries: any[] = [];
+    page.on('request', (req) => {
+        if (!req.url().includes('light.com.br')) return;
+        harEntries.push({
+            timestamp: new Date().toISOString(),
+            type: 'REQUEST',
+            method: req.method(),
+            url: req.url(),
+            resourceType: req.resourceType(),
+            headers: req.headers(),
+            postData: req.postData() || null,
+        });
+    });
+    page.on('response', async (res) => {
+        if (!res.url().includes('light.com.br')) return;
+        const headers = res.headers();
+        let bodySnippet: string | null = null;
+        try {
+            // Capture text bodies (HTML, JSON) but skip binary (images, fonts, PDFs)
+            const contentType = headers['content-type'] || '';
+            if (contentType.includes('text') || contentType.includes('json') || contentType.includes('javascript')) {
+                const body = await res.text();
+                bodySnippet = body.substring(0, 5000); // first 5KB only
+            } else if (contentType.includes('pdf')) {
+                bodySnippet = '[PDF BINARY - content-type: application/pdf]';
+            }
+        } catch { }
+        harEntries.push({
+            timestamp: new Date().toISOString(),
+            type: 'RESPONSE',
+            status: res.status(),
+            url: res.url(),
+            headers: headers,
+            bodySnippet: bodySnippet,
+        });
+    });
+    // --- END HAR CAPTURE ---
+
     // Pipe browser logs to node console
     page.on('console', msg => {
         const text = msg.text();
@@ -554,43 +593,63 @@ try {
         if (installationCode && referenceMonth) {
             log(`Starting Invoice Capture for Installation: ${installationCode}, Month: ${referenceMonth}`);
 
-            // Explicitly navigate to the "Segunda Via" (Open Bills) page
-            const billsUrl = 'https://agenciavirtual.light.com.br/AGV_Segunda_Via_VW/';
-            if (!page.url().includes('AGV_Segunda_Via_VW')) {
-                log(`Navigating to Bills Page: ${billsUrl}`);
-                await page.goto(billsUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
-                // Wait for the page content to actually render (accordion or up-to-date message)
-                log('Waiting for bills page content to render...');
-                await Promise.race([
-                    page.waitForSelector('.accordion-group', { timeout: 20000 }),
-                    page.waitForSelector('text=Você está em dia', { timeout: 20000 }),
-                    page.waitForTimeout(15000) // absolute fallback
-                ]).catch(() => log('⚠️ Bills page content wait timed out, proceeding...'));
-            } else {
-                log('Already on Bills Page.');
-            }
-
-            // Check for Open Bills OR "Up to Date" message
-            log('Checking for Open Bills or "Up to Date" message...');
-
-            const openBillsSelector = '.accordion-group';
-            const upToDateSelector = 'text=Você está em dia';
-
-            let result = '';
+            // Smart page routing: determine if the bill is likely on Open or Paid bills
+            // based on whether the reference month's 1st day is >30 days from now.
+            const monthMap: Record<string, number> = {
+                'Jan': 0, 'Fev': 1, 'Mar': 2, 'Abr': 3, 'Mai': 4, 'Jun': 5,
+                'Jul': 6, 'Ago': 7, 'Set': 8, 'Out': 9, 'Nov': 10, 'Dez': 11
+            };
+            let startOnPaidBills = false;
             try {
-                result = await Promise.race([
-                    page.waitForSelector(openBillsSelector, { timeout: 10000 }).then(() => 'BILLS'),
-                    page.waitForSelector(upToDateSelector, { timeout: 10000 }).then(() => 'UP_TO_DATE')
-                ]);
+                const [monthStr, yearStr] = referenceMonth.split('/');
+                const monthIdx = monthMap[monthStr];
+                if (monthIdx !== undefined && yearStr) {
+                    const refDate = new Date(parseInt(yearStr), monthIdx, 1);
+                    const now = new Date();
+                    const daysDiff = (now.getTime() - refDate.getTime()) / (1000 * 60 * 60 * 24);
+                    startOnPaidBills = daysDiff > 30;
+                    log(`Reference month ${referenceMonth} is ${Math.round(daysDiff)} days old → starting on ${startOnPaidBills ? 'Paid' : 'Open'} Bills`);
+                }
             } catch (e) {
-                log('⚠️ Neither bills list nor "Up to Date" message found immediately. Will try to find installation anyway.');
+                log(`⚠️ Could not parse referenceMonth "${referenceMonth}", defaulting to Open Bills.`);
             }
 
-            if (result === 'UP_TO_DATE') {
-                log('ℹ️ Account is up to date (Parabéns! Você está em dia). Switching to Paid Bills...');
-                await page.goto('https://agenciavirtual.light.com.br/AGV_Comprovante_Conta_Paga_VW/Comprovante_Conta_Paga.aspx', { waitUntil: 'domcontentloaded', timeout: 30000 });
-            } else {
-                log('ℹ️ Open bills found (or fallback). Proceeding with extraction...');
+            let onPaidBills = false;
+            const openBillsUrl = 'https://agenciavirtual.light.com.br/AGV_Segunda_Via_VW/';
+            const paidBillsUrl = 'https://agenciavirtual.light.com.br/AGV_Comprovante_Conta_Paga_VW/Comprovante_Conta_Paga.aspx';
+
+            const navigateUrl = startOnPaidBills ? paidBillsUrl : openBillsUrl;
+            onPaidBills = startOnPaidBills;
+
+            log(`Navigating to ${onPaidBills ? 'Paid' : 'Open'} Bills Page: ${navigateUrl}`);
+            await page.goto(navigateUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
+            log('Waiting for bills page content to render...');
+            await Promise.race([
+                page.waitForSelector('.accordion-group', { timeout: 20000 }),
+                page.waitForSelector('text=Você está em dia', { timeout: 20000 }),
+                page.waitForTimeout(15000) // absolute fallback
+            ]).catch(() => log('⚠️ Bills page content wait timed out, proceeding...'));
+
+            // If on Open Bills, check for "Up to Date" which means we need Paid Bills
+            if (!onPaidBills) {
+                log('Checking for Open Bills or "Up to Date" message...');
+                let result = '';
+                try {
+                    result = await Promise.race([
+                        page.waitForSelector('.accordion-group', { timeout: 10000 }).then(() => 'BILLS'),
+                        page.waitForSelector('text=Você está em dia', { timeout: 10000 }).then(() => 'UP_TO_DATE')
+                    ]);
+                } catch (e) {
+                    log('⚠️ Neither bills list nor "Up to Date" message found immediately. Will try to find installation anyway.');
+                }
+
+                if (result === 'UP_TO_DATE') {
+                    log('ℹ️ Account is up to date. Switching to Paid Bills...');
+                    await page.goto(paidBillsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                    onPaidBills = true;
+                } else {
+                    log('ℹ️ Open bills found (or fallback). Proceeding with extraction...');
+                }
             }
 
             // --- FIND INSTALLATION IN ACCORDION (Works for both Open and Paid bills pages mostly, signatures similar) ---
@@ -605,10 +664,11 @@ try {
                 .first();
 
             if (await installLocator.count() === 0) {
-                // If we are on Open Bills and didn't find it, maybe we should try Paid Bills if we haven't already?
-                if (page.url().includes('AGV_Segunda_Via_VW') && result !== 'UP_TO_DATE') {
+                // If we are on Open Bills and didn't find it, try Paid Bills
+                if (!onPaidBills) {
                     log('Installation not found on Open Bills. Trying Paid Bills page...');
-                    await page.goto('https://agenciavirtual.light.com.br/AGV_Comprovante_Conta_Paga_VW/Comprovante_Conta_Paga.aspx', { waitUntil: 'domcontentloaded', timeout: 30000 });
+                    await page.goto(paidBillsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                    onPaidBills = true;
                     try { await page.waitForSelector('.accordion-group', { timeout: 10000 }); } catch { }
 
                     installLocator = page.locator('.accordion-item')
@@ -691,10 +751,11 @@ try {
             let monthMatches = installLocator.locator(`span:text-is("${referenceMonth}")`);
             let count = await monthMatches.count();
 
-            // If month not found on current page, try Paid Bills page
-            if (count === 0 && !page.url().includes('Comprovante_Conta_Paga')) {
+            // If month not found on current page, try the OTHER page
+            if (count === 0 && !onPaidBills) {
                 log(`⚠️ Bill for ${referenceMonth} not found on Open Bills. Trying Paid Bills page...`);
-                await page.goto('https://agenciavirtual.light.com.br/AGV_Comprovante_Conta_Paga_VW/Comprovante_Conta_Paga.aspx', { waitUntil: 'load', timeout: 30000 });
+                await page.goto(paidBillsUrl, { waitUntil: 'load', timeout: 30000 });
+                onPaidBills = true;
                 log(`✅ Successfully navigated to Paid Bills page.`);
                 await new Promise(r => setTimeout(r, 3000)); // settle
 
@@ -879,7 +940,8 @@ try {
                         await elementToClick.click({ force: true });
 
                         // Check if the "Selecione o motivo" modal popped up
-                        try {
+                        // NOTE: Only Open Bills has this modal. Paid Bills downloads directly.
+                        if (!onPaidBills) try {
                             // OutSystems renders multiple .modal-wrapper instances in the DOM.
                             // We need to look specifically for the one that becomes visible.
                             const modal = page.locator('.modal-wrapper').filter({ hasText: 'Selecione o motivo' }).first();
@@ -946,6 +1008,8 @@ try {
                             }
                         } catch (e: any) {
                             log(`Modal check failed or timed out. Proceeding normally or download already started. (${e.message})`);
+                        } else {
+                            log('ℹ️ On Paid Bills — skipping modal check (not applicable).');
                         }
 
                         // Normal non-modal download flow (if modal didn't appear or if it was immediate)
@@ -1018,6 +1082,13 @@ try {
         } catch { }
         await Actor.fail(e.message);
     } finally {
+        // Save HAR capture (Phase 0 instrumentation)
+        try {
+            log(`Saving HAR capture: ${harEntries.length} entries`);
+            await Actor.setValue('HAR_CAPTURE', JSON.stringify(harEntries, null, 2), { contentType: 'application/json' });
+        } catch (e: any) {
+            log(`⚠️ Failed to save HAR: ${e.message}`);
+        }
         if (browser) await browser.close();
         await Actor.exit();
     }

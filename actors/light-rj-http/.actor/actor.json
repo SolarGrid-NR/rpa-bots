@@ -1,0 +1,15 @@
+{
+    "actorSpecification": 1,
+    "name": "light-rj-http",
+    "title": "Light RJ Bill Downloader (HTTP-Only)",
+    "description": "HTTP-only actor to download bills from Light RJ — no browser needed",
+    "version": "0.1",
+    "meta": {
+        "templateId": "ts-start"
+    },
+    "input": "../input_schema.json",
+    "dockerfile": "../Dockerfile",
+    "proxyConfiguration": {
+        "useApifyProxy": true
+    }
+}
